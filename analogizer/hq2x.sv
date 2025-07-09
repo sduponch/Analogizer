@@ -264,6 +264,8 @@ always_ff@(posedge clock) begin
 	q <= ram[rdaddress];
 end
 
+endmodule
+	
 module hq2x_buf2 #(parameter NUMWORDS, parameter AWIDTH, parameter DWIDTH)
 (
 	input                 clock,

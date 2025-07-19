@@ -256,6 +256,7 @@ module hq2x_buf #(parameter NUMWORDS, parameter AWIDTH, parameter DWIDTH)
 	input                 wren,
 	output reg [DWIDTH:0] q
 );
+endmodule
 
 reg [DWIDTH:0] ram[0:NUMWORDS-1];
 

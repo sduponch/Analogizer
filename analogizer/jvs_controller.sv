@@ -116,6 +116,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam JVS_ESCAPE_BYTE = 8'hD0;      // Escape marker byte
     localparam JVS_ESCAPED_E0 = 8'hDF;       // E0 becomes D0 DF
     localparam JVS_ESCAPED_D0 = 8'hCF;       // D0 becomes D0 CF
+    
+    // JVS Frame structure constants for better code readability
+    localparam JVS_SYNC_POS = 8'd0;          // Position of sync byte (E0)
+    localparam JVS_ADDR_POS = 8'd1;          // Position of address byte
+    localparam JVS_LENGTH_POS = 8'd2;        // Position of length byte
+    localparam JVS_DATA_START = 8'd3;        // Start position of data bytes
+    localparam JVS_OVERHEAD = 8'd2;          // Overhead for length calculation
 
     //=========================================================================
     // STATE MACHINE DEFINITIONS
@@ -302,11 +309,11 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_FIRST_RESET: begin
                     // Prepare first RESET command frame
                     // JVS requires two reset commands for reliable initialization
-                    tx_buffer[0] <= JVS_SYNC_BYTE;       // E0 - Frame start
-                    tx_buffer[1] <= JVS_BROADCAST_ADDR;  // FF - Broadcast to all devices
-                    tx_buffer[2] <= 8'h03;               // Length of data + checksum
-                    tx_buffer[3] <= CMD_RESET_B1;        // F0 - Reset command byte 1
-                    tx_buffer[4] <= CMD_RESET_B2;        // D9 - Reset command byte 2
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0 - Frame start
+                    tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Broadcast to all devices
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
+                    tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0 - Reset command byte 1
+                    tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9 - Reset command byte 2
                     rs485_tx_request <= 1'b1;           // Request transmission
                     last_tx_state <= STATE_FIRST_RESET; // Remember command for response handling
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -332,11 +339,11 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 //-------------------------------------------------------------
                 STATE_SECOND_RESET: begin
                     // Prepare second RESET command frame (identical to first)
-                    tx_buffer[0] <= JVS_SYNC_BYTE;       // E0
-                    tx_buffer[1] <= JVS_BROADCAST_ADDR;  // FF
-                    tx_buffer[2] <= 8'h03;               // Length
-                    tx_buffer[3] <= CMD_RESET_B1;        // F0
-                    tx_buffer[4] <= CMD_RESET_B2;        // D9
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
+                    tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0
+                    tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SECOND_RESET;
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -363,11 +370,11 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_SEND_SETADDR: begin
                     // Prepare SET ADDRESS command frame
                     // This assigns a unique address (0x01) to the JVS device
-                    tx_buffer[0] <= JVS_SYNC_BYTE;       // E0
-                    tx_buffer[1] <= JVS_BROADCAST_ADDR;  // FF - Still broadcast for address assignment
-                    tx_buffer[2] <= 8'h03;               // Length
-                    tx_buffer[3] <= CMD_SETADDR;         // F1 - Set address command
-                    tx_buffer[4] <= current_device_addr; // 01 - Address to assign
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Still broadcast for address assignment
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
+                    tx_buffer[JVS_DATA_START + 0] <= CMD_SETADDR;         // F1 - Set address command
+                    tx_buffer[JVS_DATA_START + 1] <= current_device_addr; // 01 - Address to assign
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_SETADDR;
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -379,10 +386,10 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_SEND_READID: begin
                     // Prepare READ ID command frame
                     // This requests the device to send its identification string
-                    tx_buffer[0] <= JVS_SYNC_BYTE;       // E0
-                    tx_buffer[1] <= current_device_addr; // 01 - Address specific device
-                    tx_buffer[2] <= 8'h02;               // Length
-                    tx_buffer[3] <= CMD_READID;          // 10 - Read ID command
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01 - Address specific device
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data bytes + overhead
+                    tx_buffer[JVS_DATA_START + 0] <= CMD_READID;          // 10 - Read ID command
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_READID;
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -394,30 +401,30 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_SEND_INPUTS: begin
                     // Prepare READ INPUTS command frame
                     // This complex command specifies exactly which inputs to read
-                    tx_buffer[0] <= JVS_SYNC_BYTE;       // E0
-                    tx_buffer[1] <= current_device_addr; // 01
-                    tx_buffer[2] <= 8'h12;               // Length (18 bytes of data)
-                    tx_buffer[3] <= CMD_READ_INPUTS;     // 20 - Read inputs command
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
+                    tx_buffer[JVS_DATA_START + 0] <= CMD_READ_INPUTS;     // 20 - Read inputs command
                     
                     // Input specification - tells device what data to return
-                    tx_buffer[4] <= 8'h02;               // Number of players (2)
-                    tx_buffer[5] <= 8'h02;               // Bytes per player (2)
-                    tx_buffer[6] <= 8'h21;               // Player 1 system inputs
-                    tx_buffer[7] <= 8'h01;               // Player 1 button inputs
-                    tx_buffer[8] <= 8'h22;               // Player 2 system inputs
-                    tx_buffer[9] <= 8'h06;               // Player 2 button inputs
+                    tx_buffer[JVS_DATA_START + 1] <= 8'h02;               // Number of players (2)
+                    tx_buffer[JVS_DATA_START + 2] <= 8'h02;               // Bytes per player (2)
+                    tx_buffer[JVS_DATA_START + 3] <= 8'h21;               // Player 1 system inputs
+                    tx_buffer[JVS_DATA_START + 4] <= 8'h01;               // Player 1 button inputs
+                    tx_buffer[JVS_DATA_START + 5] <= 8'h22;               // Player 2 system inputs
+                    tx_buffer[JVS_DATA_START + 6] <= 8'h06;               // Player 2 button inputs
                     
                     // Analog channel specifications
-                    tx_buffer[10] <= 8'h32;              // Analog channel 1 request
-                    tx_buffer[11] <= 8'h02;              // 2 bytes of analog data
-                    tx_buffer[12] <= 8'h00;              // Analog 1 data MSB
-                    tx_buffer[13] <= 8'h00;              // Analog 1 data LSB
-                    tx_buffer[14] <= 8'h33;              // Analog channel 2 request
-                    tx_buffer[15] <= 8'h02;              // 2 bytes of analog data
-                    tx_buffer[16] <= 8'h00;              // Analog 2 data MSB
-                    tx_buffer[17] <= 8'h00;              // Analog 2 data LSB
-                    tx_buffer[18] <= 8'h00;              // Padding byte
-                    tx_buffer[19] <= 8'h00;              // Padding byte
+                    tx_buffer[JVS_DATA_START + 7] <= 8'h32;              // Analog channel 1 request
+                    tx_buffer[JVS_DATA_START + 8] <= 8'h02;              // 2 bytes of analog data
+                    tx_buffer[JVS_DATA_START + 9] <= 8'h00;              // Analog 1 data MSB
+                    tx_buffer[JVS_DATA_START + 10] <= 8'h00;              // Analog 1 data LSB
+                    tx_buffer[JVS_DATA_START + 11] <= 8'h33;              // Analog channel 2 request
+                    tx_buffer[JVS_DATA_START + 12] <= 8'h02;              // 2 bytes of analog data
+                    tx_buffer[JVS_DATA_START + 13] <= 8'h00;              // Analog 2 data MSB
+                    tx_buffer[JVS_DATA_START + 14] <= 8'h00;              // Analog 2 data LSB
+                    tx_buffer[JVS_DATA_START + 15] <= 8'h00;              // Padding byte
+                    tx_buffer[JVS_DATA_START + 16] <= 8'h00;              // Padding byte
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 16;               // 16 data bytes + overhead
                     
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_INPUTS;
@@ -432,7 +439,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     if (rs485_state == RS485_TRANSMIT) begin
                         tx_counter <= 8'h00;                    // Reset byte counter
                         tx_checksum <= 8'h00;                   // Reset checksum
-                        tx_length <= 8'd3 + tx_buffer[2];       // Calculate total frame length
+                        tx_length <= JVS_DATA_START + tx_buffer[JVS_LENGTH_POS];       // Calculate total frame length
                         main_state <= STATE_TRANSMIT_BYTE;
                     end
                 end
@@ -505,7 +512,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_WAIT_RX: begin
                     if (rx_frame_complete) begin
                         // Process response based on command sent
-                        case (tx_buffer[3])
+                        case (tx_buffer[JVS_DATA_START])
                             CMD_SETADDR: main_state <= STATE_SEND_READID;    // Address set, now read ID
                             CMD_READID: main_state <= STATE_IDLE;            // ID read, start polling
                             CMD_READ_INPUTS: main_state <= STATE_IDLE;       // Inputs read, continue polling
@@ -515,7 +522,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                         timeout_counter <= timeout_counter + 1;
                     end else begin
                         // Timeout handling - different strategies for different commands
-                        case (tx_buffer[3])
+                        case (tx_buffer[JVS_DATA_START])
                             CMD_SETADDR: main_state <= STATE_FIRST_RESET;    // Critical - restart sequence
                             CMD_READID: main_state <= STATE_SEND_READID;     // Retry ID read
                             default: main_state <= STATE_IDLE;               // Continue with polling
@@ -630,19 +637,19 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             // RX_UNESCAPE - Iterate buffer and look after escape sequence then replace the byte and shift buffer from 1 byte in RX_SHIFT
             //-------------------------------------------------------------
             if (rx_state == RX_UNESCAPE) begin
-                if (unescape_idx + 8'd3 < (8'd3 + rx_buffer[2] - 1)) begin // Add 3 offset, use original length, -1 for checksum
-                    if (rx_buffer[unescape_idx + 8'd3] == JVS_ESCAPE_BYTE && 
-                        unescape_idx + 8'd3 + 1 < (8'd3 + rx_buffer[2] - 1)) begin
+                if (unescape_idx + JVS_DATA_START < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS] - 1)) begin // Add data offset, use original length, -1 for checksum
+                    if (rx_buffer[unescape_idx + JVS_DATA_START] == JVS_ESCAPE_BYTE && 
+                        unescape_idx + JVS_DATA_START + 1 < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS] - 1)) begin
                         // Escape sequence detected
-                        if (rx_buffer[unescape_idx + 8'd3 + 1] == JVS_ESCAPED_E0) begin
+                        if (rx_buffer[unescape_idx + JVS_DATA_START + 1] == JVS_ESCAPED_E0) begin
                             // D0 DF -> E0: Replace first byte, start shifting
-                            rx_buffer[unescape_idx + 8'd3] <= JVS_SYNC_BYTE;
-                            shift_idx <= unescape_idx + 8'd3 + 1; // Start shifting from next position
+                            rx_buffer[unescape_idx + JVS_DATA_START] <= JVS_SYNC_BYTE;
+                            shift_idx <= unescape_idx + JVS_DATA_START + 1; // Start shifting from next position
                             rx_state <= RX_SHIFT; // Go to shift state
-                        end else if (rx_buffer[unescape_idx + 8'd3 + 1] == JVS_ESCAPED_D0) begin
+                        end else if (rx_buffer[unescape_idx + JVS_DATA_START + 1] == JVS_ESCAPED_D0) begin
                             // D0 CF -> D0: Replace first byte, start shifting
-                            rx_buffer[unescape_idx + 8'd3] <= JVS_ESCAPE_BYTE;
-                            shift_idx <= unescape_idx + 8'd3 + 1; // Start shifting from next position
+                            rx_buffer[unescape_idx + JVS_DATA_START] <= JVS_ESCAPE_BYTE;
+                            shift_idx <= unescape_idx + JVS_DATA_START + 1; // Start shifting from next position
                             rx_state <= RX_SHIFT; // Go to shift state
                         end else begin
                             // Not a valid escape sequence, move to next byte
@@ -663,13 +670,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             // RX_SHIFT - Shift bytes left after escape sequence removal and update buffer length byte
             //-------------------------------------------------------------
             if (rx_state == RX_SHIFT) begin
-                if (shift_idx < (8'd3 + rx_buffer[2])) begin // Use current length
+                if (shift_idx < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS])) begin // Use current length
                     // Shift current byte one position left
                     rx_buffer[shift_idx] <= rx_buffer[shift_idx + 1];
                     shift_idx <= shift_idx + 1;
                 end else begin
                     // Finished shifting, now decrement length since we removed one byte
-                    rx_buffer[2] <= rx_buffer[2] - 1;
+                    rx_buffer[JVS_LENGTH_POS] <= rx_buffer[JVS_LENGTH_POS] - 1;
                     // Continue unescaping from same position (don't increment unescape_idx)
                     rx_state <= RX_UNESCAPE;
                 end
@@ -686,7 +693,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // Validate response format: E0 00 XX 01 (sync, master addr, length, normal status)
                     if (rx_buffer[1] == 8'h00 && rx_buffer[3] == STATUS_NORMAL) begin
                         // Ensure minimum frame size for button data
-                        if (rx_buffer[2] >= 8) begin
+                        if (rx_buffer[JVS_LENGTH_POS] >= 8) begin
                             
                             //=================================================
                             // PLAYER 1 BUTTON MAPPING
@@ -728,7 +735,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             //=================================================
                             // PLAYER 2 BUTTON MAPPING (if present in frame)
                             //=================================================
-                            if (rx_buffer[2] >= 10) begin  // Check if frame contains P2 data
+                            if (rx_buffer[JVS_LENGTH_POS] >= 10) begin  // Check if frame contains P2 data
                                 // JVS P2 data typically at positions 8 and 9
                                 // rx_buffer[8] = P2 buttons, rx_buffer[9] = P2 directions
                                 
@@ -763,7 +770,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             //=================================================
                             // ANALOG STICK DATA MAPPING (if present in frame)
                             //=================================================
-                            if (rx_buffer[2] >= 14) begin  // Check if frame contains analog data
+                            if (rx_buffer[JVS_LENGTH_POS] >= 14) begin  // Check if frame contains analog data
                                 // JVS analog data format: 8-bit values where 0x80 = center position
                                 // Analogue Pocket expects same format: 0x80 = center
                                 
@@ -780,7 +787,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             //=================================================
                             // PLAYER 2 ANALOG DATA (if present in frame)
                             //=================================================
-                            if (rx_buffer[2] >= 18) begin  // Check if frame contains P2 analog data
+                            if (rx_buffer[JVS_LENGTH_POS] >= 18) begin  // Check if frame contains P2 analog data
                                 // Player 2 analog stick data (typically at positions 14-17)
                                 p2_joy_state[7:0] <= rx_buffer[14];    // P2 Left stick X
                                 p2_joy_state[15:8] <= rx_buffer[15];   // P2 Left stick Y

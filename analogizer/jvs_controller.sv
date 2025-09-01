@@ -112,6 +112,11 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam CMD_READ_INPUTS = 8'h20;      // Read input states command
     localparam STATUS_NORMAL = 8'h01;        // Normal status response code
 
+    // JVS Escape sequence constants for data byte escaping
+    localparam JVS_ESCAPE_BYTE = 8'hD0;      // Escape marker byte
+    localparam JVS_ESCAPED_E0 = 8'hDF;       // E0 becomes D0 DF
+    localparam JVS_ESCAPED_D0 = 8'hCF;       // D0 becomes D0 CF
+
     //=========================================================================
     // STATE MACHINE DEFINITIONS
     //=========================================================================
@@ -143,7 +148,9 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam RX_READ_ADDR = 3'h1;           // Reading address byte
     localparam RX_READ_SIZE = 3'h2;           // Reading length byte
     localparam RX_READ_DATA = 3'h3;           // Reading data bytes and checksum
-    localparam RX_PROCESS = 3'h4;             // Processing complete frame
+    localparam RX_UNESCAPE = 3'h4;            // After a JVS frame is fully received we process escaping
+    localparam RX_SHIFT = 3'h5;               // On escaping process it shift the buffer 1 byte to the left
+    localparam RX_PROCESS = 3'h6;             // Processing complete and unescaped frame
 
     //=========================================================================
     // STATE VARIABLES AND CONTROL REGISTERS
@@ -165,7 +172,10 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     reg [7:0] rx_length;         // Length of current incoming frame
     reg [7:0] rx_counter;        // Current byte position in reception
     reg [7:0] rx_checksum;       // Running checksum verification
-    
+    // Escape sequence decoding variables
+    reg [7:0] unescape_idx;      // Index for unescaping
+    reg [7:0] shift_idx;         // Index for shifting bytes left after escape found
+
     // Timing and protocol control
     reg [31:0] delay_counter;    // Multi-purpose delay counter
     reg [31:0] timeout_counter;  // Timeout counter for waiting states
@@ -602,7 +612,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                         end else begin
                             // Last byte (checksum) received
                             if (rx_checksum == uart_rx_byte) begin
-                                rx_state <= RX_PROCESS;           // Checksum valid, process frame
+                                rx_state <= RX_UNESCAPE;          // Checksum valid, start unescaping
+                                unescape_idx <= 8'd0;             // Reset to 0, will add 3 in RX_UNESCAPE
                                 rx_counter <= 0;
                             end else begin
                                 rx_state <= RX_IDLE;              // Checksum invalid, discard frame
@@ -615,6 +626,55 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 endcase
             end
             
+            //-------------------------------------------------------------
+            // RX_UNESCAPE - Iterate buffer and look after escape sequence then replace the byte and shift buffer from 1 byte in RX_SHIFT
+            //-------------------------------------------------------------
+            if (rx_state == RX_UNESCAPE) begin
+                if (unescape_idx + 8'd3 < (8'd3 + rx_buffer[2] - 1)) begin // Add 3 offset, use original length, -1 for checksum
+                    if (rx_buffer[unescape_idx + 8'd3] == JVS_ESCAPE_BYTE && 
+                        unescape_idx + 8'd3 + 1 < (8'd3 + rx_buffer[2] - 1)) begin
+                        // Escape sequence detected
+                        if (rx_buffer[unescape_idx + 8'd3 + 1] == JVS_ESCAPED_E0) begin
+                            // D0 DF -> E0: Replace first byte, start shifting
+                            rx_buffer[unescape_idx + 8'd3] <= JVS_SYNC_BYTE;
+                            shift_idx <= unescape_idx + 8'd3 + 1; // Start shifting from next position
+                            rx_state <= RX_SHIFT; // Go to shift state
+                        end else if (rx_buffer[unescape_idx + 8'd3 + 1] == JVS_ESCAPED_D0) begin
+                            // D0 CF -> D0: Replace first byte, start shifting
+                            rx_buffer[unescape_idx + 8'd3] <= JVS_ESCAPE_BYTE;
+                            shift_idx <= unescape_idx + 8'd3 + 1; // Start shifting from next position
+                            rx_state <= RX_SHIFT; // Go to shift state
+                        end else begin
+                            // Not a valid escape sequence, move to next byte
+                            unescape_idx <= unescape_idx + 1;
+                        end
+                    end else begin
+                        // Normal byte, move to next position
+                        unescape_idx <= unescape_idx + 1;
+                    end
+                end else begin
+                    // Finished processing, reset index and move to RX_PROCESS
+                    unescape_idx <= 8'h00;
+                    rx_state <= RX_PROCESS;
+                end
+            end
+
+            //-------------------------------------------------------------
+            // RX_SHIFT - Shift bytes left after escape sequence removal and update buffer length byte
+            //-------------------------------------------------------------
+            if (rx_state == RX_SHIFT) begin
+                if (shift_idx < (8'd3 + rx_buffer[2])) begin // Use current length
+                    // Shift current byte one position left
+                    rx_buffer[shift_idx] <= rx_buffer[shift_idx + 1];
+                    shift_idx <= shift_idx + 1;
+                end else begin
+                    // Finished shifting, now decrement length since we removed one byte
+                    rx_buffer[2] <= rx_buffer[2] - 1;
+                    // Continue unescaping from same position (don't increment unescape_idx)
+                    rx_state <= RX_UNESCAPE;
+                end
+            end
+
             //-------------------------------------------------------------
             // RX_PROCESS - Process complete valid frames
             //-------------------------------------------------------------

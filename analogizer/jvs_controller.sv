@@ -315,9 +315,9 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // JVS requires two reset commands for reliable initialization
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0 - Frame start
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Broadcast to all devices
-                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0 - Reset command byte 1
                     tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9 - Reset command byte 2
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;           // Request transmission
                     last_tx_state <= STATE_FIRST_RESET; // Remember command for response handling
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -345,9 +345,9 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // Prepare second RESET command frame (identical to first)
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF
-                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0
                     tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SECOND_RESET;
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -376,9 +376,9 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // This assigns a unique address (0x01) to the JVS device
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Still broadcast for address assignment
-                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     tx_buffer[JVS_DATA_START + 0] <= CMD_SETADDR;         // F1 - Set address command
                     tx_buffer[JVS_DATA_START + 1] <= current_device_addr; // 01 - Address to assign
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_SETADDR;
                     main_state <= STATE_WAIT_TX_SETUP;
@@ -392,8 +392,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // This requests the device to send its identification string
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01 - Address specific device
-                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data bytes + overhead
                     tx_buffer[JVS_DATA_START + 0] <= CMD_READID;          // 10 - Read ID command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data bytes + overhead
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_READID;
                     main_state <= STATE_WAIT_TX_SETUP;

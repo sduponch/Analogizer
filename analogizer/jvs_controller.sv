@@ -11,7 +11,9 @@
 // CURRENT STATUS:
 // - Core protocol working (Reset, Address assignment, Input polling)
 // - Basic button mapping functional (D-PAD, face buttons, START/SELECT)
+// - JVS escape sequence support implemented (D0 DF → E0, D0 CF → D0)
 // - Optimized for gaming performance (1ms polling, minimal latency)
+// - FPGA resource usage optimized with configurable buffer sizes
 // - Protocol implementation incomplete (missing capabilities, device info)
 // - Button positions may need verification/adjustment
 // - Single device support only
@@ -19,7 +21,8 @@
 // ARCHITECTURE:
 // - RS485 State Machine: Manages transceiver direction and timing
 // - Main State Machine: Handles JVS protocol sequence and commands  
-// - RX State Machine: Processes incoming JVS responses and button data
+// - RX State Machine: Processes incoming JVS responses with escape sequence decoding
+// - Two-buffer system: Raw buffer for incoming data, processed buffer for unescaped data
 //
 // HARDWARE REQUIREMENTS:
 // - External MAX485 or equivalent RS485 transceiver
@@ -1160,8 +1163,10 @@ DEVELOPMENT STATUS:
 ✅ Core Protocol: Working (Reset, Address, ID, Input polling)
 ✅ Basic Buttons: Working (D-PAD, 4 Face buttons, START)
 ✅ Basic Analog: Working (2 analog sticks with centering)
+✅ Escape Sequences: Working (D0 DF → E0, D0 CF → D0 decoding)
 ✅ RS485 Timing: Working (Proper setup/hold times)
 ✅ Performance: Optimized (1ms polling, 10ms timeouts)
+✅ FPGA Resources: Optimized with configurable buffer sizes (RX_BUFFER_SIZE, TX_BUFFER_SIZE)
 
 ⚠️  Button Mapping: Needs verification (START position unclear)
 ⚠️  Player 2: Present but not fully tested

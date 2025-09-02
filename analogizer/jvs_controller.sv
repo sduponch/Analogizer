@@ -108,10 +108,15 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     // Standard JVS protocol bytes as defined in JAMMA specification
     localparam JVS_SYNC_BYTE = 8'hE0;        // Frame start synchronization byte
     localparam JVS_BROADCAST_ADDR = 8'hFF;   // Broadcast address for all devices
+    localparam JVS_HOST_ADDR = 8'h00;        // Host/Master address
     localparam CMD_RESET_B1 = 8'hF0;         // Reset command byte 1
     localparam CMD_RESET_B2 = 8'hD9;         // Reset command byte 2 (must follow B1)
     localparam CMD_SETADDR = 8'hF1;          // Set device address command
     localparam CMD_READID = 8'h10;           // Read device identification command
+    localparam CMD_CMDREV = 8'h11;           // Command format revision command
+    localparam CMD_JVSREV = 8'h12;           // JVS revision command  
+    localparam CMD_COMMVER = 8'h13;          // Communications version command
+    localparam CMD_FEATCHK = 8'h14;          // Feature check command
     localparam CMD_READ_INPUTS = 8'h20;      // Read input states command
     localparam STATUS_NORMAL = 8'h01;        // Normal status response code
 
@@ -124,12 +129,17 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam JVS_SYNC_POS = 8'd0;          // Position of sync byte (E0)
     localparam JVS_ADDR_POS = 8'd1;          // Position of address byte
     localparam JVS_LENGTH_POS = 8'd2;        // Position of length byte
-    localparam JVS_DATA_START = 8'd3;        // Start position of data bytes
+    localparam JVS_DATA_START = 8'd3;        // Start position of data bytes (RX)
+    localparam JVS_CMD_START = 8'd3;         // Start position of command bytes (TX)
     localparam JVS_OVERHEAD = 8'd2;          // Overhead for length calculation
 
     // Buffer size configuration for resource optimization
     localparam RX_BUFFER_SIZE = 128;         // Size of RX buffers (I/O Identify max 106 bytes)
     localparam TX_BUFFER_SIZE = 24;          // Size of TX buffer (max frame ~21 bytes)
+    
+    // JVS node management constants
+    localparam MAX_JVS_NODES = 2;            // Maximum supported JVS nodes (current implementation)
+    localparam NODE_NAME_SIZE = 100;         // Maximum size for node identification strings (per JVS spec)
 
     //=========================================================================
     // STATE MACHINE DEFINITIONS
@@ -144,12 +154,16 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam STATE_SECOND_RESET_DELAY = 4'h5; // Delay after second reset
     localparam STATE_SEND_SETADDR = 4'h6;     // Send address assignment command
     localparam STATE_SEND_READID = 4'h7;      // Send device ID request
-    localparam STATE_SEND_INPUTS = 4'h8;      // Send input state request
-    localparam STATE_WAIT_TX_SETUP = 4'h9;    // Wait for RS485 setup time
-    localparam STATE_TRANSMIT_BYTE = 4'hA;    // Transmit data bytes
-    localparam STATE_WAIT_TX_DONE = 4'hB;     // Wait for transmission completion
-    localparam STATE_WAIT_TX_HOLD = 4'hC;     // Wait for RS485 hold time
-    localparam STATE_WAIT_RX = 4'hD;          // Wait for device response
+    localparam STATE_SEND_CMDREV = 4'h8;      // Send command revision request
+    localparam STATE_SEND_JVSREV = 4'h9;      // Send JVS revision request
+    localparam STATE_SEND_COMMVER = 4'hA;     // Send communications version request
+    localparam STATE_SEND_FEATCHK = 4'hB;     // Send feature check request
+    localparam STATE_SEND_INPUTS = 4'hC;      // Send input state request
+    localparam STATE_WAIT_TX_SETUP = 4'hD;    // Wait for RS485 setup time
+    localparam STATE_TRANSMIT_BYTE = 4'hE;    // Transmit data bytes
+    localparam STATE_WAIT_TX_DONE = 4'hF;     // Wait for transmission completion
+    localparam STATE_WAIT_TX_HOLD = 5'h10;    // Wait for RS485 hold time
+    localparam STATE_WAIT_RX = 5'h11;         // Wait for device response
 
     // RS485 State Machine - Controls transceiver direction with proper timing
     localparam RS485_RECEIVE = 2'b00;         // Receive mode (default)
@@ -164,12 +178,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam RX_READ_DATA = 3'h3;           // Reading data bytes and checksum
     localparam RX_UNESCAPE = 3'h4;            // Copy from raw buffer to final buffer, processing escapes
     localparam RX_PROCESS = 3'h5;             // Processing complete and unescaped frame
+    localparam RX_COPY_NAME = 3'h6;           // Copy node name from response data
 
     //=========================================================================
     // STATE VARIABLES AND CONTROL REGISTERS
     //=========================================================================
     // Current state for each state machine
-    reg [3:0] main_state;        // Main protocol state
+    reg [4:0] main_state;        // Main protocol state
     reg [1:0] rs485_state;       // RS485 transceiver state
     reg [2:0] rx_state;          // Receive frame processing state
     
@@ -186,9 +201,9 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     reg [7:0] rx_length;         // Length of current incoming frame
     reg [7:0] rx_counter;        // Current byte position in reception
     reg [7:0] rx_checksum;       // Running checksum verification
-    // Escape sequence decoding variables
-    reg [7:0] unescape_read_idx;  // Read index in raw buffer
-    reg [7:0] unescape_write_idx; // Write index in final buffer
+    // Generic copy variables (used for unescape and name copying)
+    reg [7:0] copy_read_idx;      // Read index for copy operations
+    reg [7:0] copy_write_idx;     // Write index for copy operations
 
     // Timing and protocol control
     reg [31:0] delay_counter;    // Multi-purpose delay counter
@@ -196,7 +211,16 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     reg [31:0] poll_timer;       // Timer for input polling frequency
     reg [7:0] current_device_addr; // Address assigned to JVS device (usually 0x01)
     reg rx_frame_complete;       // Flag indicating complete frame received
-    reg [3:0] last_tx_state;     // Tracks the last command sent for response handling
+    reg [4:0] last_tx_state;     // Tracks the last command sent for response handling
+    
+    //=========================================================================
+    // JVS NODE INFORMATION STRUCTURES
+    //=========================================================================
+    // Structure to store information about each JVS node
+    reg [7:0] node_name [0:MAX_JVS_NODES-1][0:NODE_NAME_SIZE-1]; // Node identification strings
+    reg [7:0] node_cmd_ver [0:MAX_JVS_NODES-1];    // Command version for each node
+    reg [7:0] node_jvs_ver [0:MAX_JVS_NODES-1];    // JVS version for each node  
+    reg [7:0] node_com_ver [0:MAX_JVS_NODES-1];    // Communication version for each node
     
     //=========================================================================
     // RS485 DIRECTION CONTROL
@@ -276,7 +300,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             current_device_addr <= 8'h01;    // Standard JVS device address
             rs485_tx_request <= 1'b0;
             uart_tx_dv <= 1'b0;
-            last_tx_state <= 4'h0;
+            last_tx_state <= 5'h0;
         end else begin
             case (main_state)
                 //-------------------------------------------------------------
@@ -318,8 +342,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // JVS requires two reset commands for reliable initialization
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0 - Frame start
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Broadcast to all devices
-                    tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0 - Reset command byte 1
-                    tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9 - Reset command byte 2
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_RESET_B1;        // F0 - Reset command byte 1
+                    tx_buffer[JVS_CMD_START + 1] <= CMD_RESET_B2;        // D9 - Reset command byte 2
                     tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;           // Request transmission
                     last_tx_state <= STATE_FIRST_RESET; // Remember command for response handling
@@ -348,8 +372,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // Prepare second RESET command frame (identical to first)
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF
-                    tx_buffer[JVS_DATA_START + 0] <= CMD_RESET_B1;        // F0
-                    tx_buffer[JVS_DATA_START + 1] <= CMD_RESET_B2;        // D9
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_RESET_B1;        // F0
+                    tx_buffer[JVS_CMD_START + 1] <= CMD_RESET_B2;        // D9
                     tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SECOND_RESET;
@@ -379,8 +403,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // This assigns a unique address (0x01) to the JVS device
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= JVS_BROADCAST_ADDR;  // FF - Still broadcast for address assignment
-                    tx_buffer[JVS_DATA_START + 0] <= CMD_SETADDR;         // F1 - Set address command
-                    tx_buffer[JVS_DATA_START + 1] <= current_device_addr; // 01 - Address to assign
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_SETADDR;         // F1 - Set address command
+                    tx_buffer[JVS_CMD_START + 1] <= current_device_addr; // 01 - Address to assign
                     tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 1;               // 1 data byte + overhead
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_SETADDR;
@@ -395,10 +419,66 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // This requests the device to send its identification string
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01 - Address specific device
-                    tx_buffer[JVS_DATA_START + 0] <= CMD_READID;          // 10 - Read ID command
-                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data bytes + overhead
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_READID;          // 10 - Read ID command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data byte + overhead (just command)
                     rs485_tx_request <= 1'b1;
                     last_tx_state <= STATE_SEND_READID;
+                    main_state <= STATE_WAIT_TX_SETUP;
+                end
+
+                //-------------------------------------------------------------
+                // COMMAND REVISION REQUEST - Get command format revision
+                //-------------------------------------------------------------
+                STATE_SEND_CMDREV: begin
+                    // Prepare CMDREV command frame
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_CMDREV;          // 11 - Command revision command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data byte + overhead (just command)
+                    rs485_tx_request <= 1'b1;
+                    last_tx_state <= STATE_SEND_CMDREV;
+                    main_state <= STATE_WAIT_TX_SETUP;
+                end
+
+                //-------------------------------------------------------------
+                // JVS REVISION REQUEST - Get JVS protocol revision
+                //-------------------------------------------------------------
+                STATE_SEND_JVSREV: begin
+                    // Prepare JVSREV command frame
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_JVSREV;          // 12 - JVS revision command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data byte + overhead (just command)
+                    rs485_tx_request <= 1'b1;
+                    last_tx_state <= STATE_SEND_JVSREV;
+                    main_state <= STATE_WAIT_TX_SETUP;
+                end
+
+                //-------------------------------------------------------------
+                // COMMUNICATIONS VERSION REQUEST - Get communication version
+                //-------------------------------------------------------------
+                STATE_SEND_COMMVER: begin
+                    // Prepare COMMVER command frame
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_COMMVER;         // 13 - Communications version command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data byte + overhead (just command)
+                    rs485_tx_request <= 1'b1;
+                    last_tx_state <= STATE_SEND_COMMVER;
+                    main_state <= STATE_WAIT_TX_SETUP;
+                end
+
+                //-------------------------------------------------------------
+                // FEATURE CHECK REQUEST - Get device capabilities
+                //-------------------------------------------------------------
+                STATE_SEND_FEATCHK: begin
+                    // Prepare FEATCHK command frame
+                    tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
+                    tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_FEATCHK;         // 14 - Feature check command
+                    tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 0;               // 0 data byte + overhead (just command)
+                    rs485_tx_request <= 1'b1;
+                    last_tx_state <= STATE_SEND_FEATCHK;
                     main_state <= STATE_WAIT_TX_SETUP;
                 end
 
@@ -410,27 +490,27 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // This complex command specifies exactly which inputs to read
                     tx_buffer[JVS_SYNC_POS] <= JVS_SYNC_BYTE;       // E0
                     tx_buffer[JVS_ADDR_POS] <= current_device_addr; // 01
-                    tx_buffer[JVS_DATA_START + 0] <= CMD_READ_INPUTS;     // 20 - Read inputs command
+                    tx_buffer[JVS_CMD_START + 0] <= CMD_READ_INPUTS;     // 20 - Read inputs command
                     
                     // Input specification - tells device what data to return
-                    tx_buffer[JVS_DATA_START + 1] <= 8'h02;               // Number of players (2)
-                    tx_buffer[JVS_DATA_START + 2] <= 8'h02;               // Bytes per player (2)
-                    tx_buffer[JVS_DATA_START + 3] <= 8'h21;               // Player 1 system inputs
-                    tx_buffer[JVS_DATA_START + 4] <= 8'h01;               // Player 1 button inputs
-                    tx_buffer[JVS_DATA_START + 5] <= 8'h22;               // Player 2 system inputs
-                    tx_buffer[JVS_DATA_START + 6] <= 8'h06;               // Player 2 button inputs
+                    tx_buffer[JVS_CMD_START + 1] <= 8'h02;               // Number of players (2)
+                    tx_buffer[JVS_CMD_START + 2] <= 8'h02;               // Bytes per player (2)
+                    tx_buffer[JVS_CMD_START + 3] <= 8'h21;               // Player 1 system inputs
+                    tx_buffer[JVS_CMD_START + 4] <= 8'h01;               // Player 1 button inputs
+                    tx_buffer[JVS_CMD_START + 5] <= 8'h22;               // Player 2 system inputs
+                    tx_buffer[JVS_CMD_START + 6] <= 8'h06;               // Player 2 button inputs
                     
                     // Analog channel specifications
-                    tx_buffer[JVS_DATA_START + 7] <= 8'h32;              // Analog channel 1 request
-                    tx_buffer[JVS_DATA_START + 8] <= 8'h02;              // 2 bytes of analog data
-                    tx_buffer[JVS_DATA_START + 9] <= 8'h00;              // Analog 1 data MSB
-                    tx_buffer[JVS_DATA_START + 10] <= 8'h00;              // Analog 1 data LSB
-                    tx_buffer[JVS_DATA_START + 11] <= 8'h33;              // Analog channel 2 request
-                    tx_buffer[JVS_DATA_START + 12] <= 8'h02;              // 2 bytes of analog data
-                    tx_buffer[JVS_DATA_START + 13] <= 8'h00;              // Analog 2 data MSB
-                    tx_buffer[JVS_DATA_START + 14] <= 8'h00;              // Analog 2 data LSB
-                    tx_buffer[JVS_DATA_START + 15] <= 8'h00;              // Padding byte
-                    tx_buffer[JVS_DATA_START + 16] <= 8'h00;              // Padding byte
+                    tx_buffer[JVS_CMD_START + 7] <= 8'h32;              // Analog channel 1 request
+                    tx_buffer[JVS_CMD_START + 8] <= 8'h02;              // 2 bytes of analog data
+                    tx_buffer[JVS_CMD_START + 9] <= 8'h00;              // Analog 1 data MSB
+                    tx_buffer[JVS_CMD_START + 10] <= 8'h00;              // Analog 1 data LSB
+                    tx_buffer[JVS_CMD_START + 11] <= 8'h33;              // Analog channel 2 request
+                    tx_buffer[JVS_CMD_START + 12] <= 8'h02;              // 2 bytes of analog data
+                    tx_buffer[JVS_CMD_START + 13] <= 8'h00;              // Analog 2 data MSB
+                    tx_buffer[JVS_CMD_START + 14] <= 8'h00;              // Analog 2 data LSB
+                    tx_buffer[JVS_CMD_START + 15] <= 8'h00;              // Padding byte
+                    tx_buffer[JVS_CMD_START + 16] <= 8'h00;              // Padding byte
                     tx_buffer[JVS_LENGTH_POS] <= JVS_OVERHEAD + 16;               // 16 data bytes + overhead
                     
                     rs485_tx_request <= 1'b1;
@@ -519,9 +599,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                 STATE_WAIT_RX: begin
                     if (rx_frame_complete) begin
                         // Process response based on command sent
-                        case (tx_buffer[JVS_DATA_START])
+                        case (tx_buffer[JVS_CMD_START])
                             CMD_SETADDR: main_state <= STATE_SEND_READID;    // Address set, now read ID
-                            CMD_READID: main_state <= STATE_IDLE;            // ID read, start polling
+                            CMD_READID: main_state <= STATE_SEND_CMDREV;     // ID read, get command revision
+                            CMD_CMDREV: main_state <= STATE_SEND_JVSREV;     // Command revision read, get JVS revision
+                            CMD_JVSREV: main_state <= STATE_SEND_COMMVER;    // JVS revision read, get comm version
+                            CMD_COMMVER: main_state <= STATE_SEND_FEATCHK;   // Comm version read, check features
+                            CMD_FEATCHK: main_state <= STATE_IDLE;           // Features checked, start polling
                             CMD_READ_INPUTS: main_state <= STATE_IDLE;       // Inputs read, continue polling
                             default: main_state <= STATE_IDLE;
                         endcase
@@ -529,9 +613,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                         timeout_counter <= timeout_counter + 1;
                     end else begin
                         // Timeout handling - different strategies for different commands
-                        case (tx_buffer[JVS_DATA_START])
+                        case (tx_buffer[JVS_CMD_START])
                             CMD_SETADDR: main_state <= STATE_FIRST_RESET;    // Critical - restart sequence
                             CMD_READID: main_state <= STATE_SEND_READID;     // Retry ID read
+                            CMD_CMDREV: main_state <= STATE_SEND_CMDREV;     // Retry command revision
+                            CMD_JVSREV: main_state <= STATE_SEND_JVSREV;     // Retry JVS revision
+                            CMD_COMMVER: main_state <= STATE_SEND_COMMVER;   // Retry comm version
+                            CMD_FEATCHK: main_state <= STATE_SEND_FEATCHK;   // Retry feature check
                             default: main_state <= STATE_IDLE;               // Continue with polling
                         endcase
                     end
@@ -591,7 +679,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // RX_READ_ADDR - Read address byte (should be 0x00 for master)
                     //-----------------------------------------------------
                     RX_READ_ADDR: begin
-                        if (uart_rx_byte == 8'h00) begin          // Valid master address
+                        if (uart_rx_byte == JVS_HOST_ADDR) begin          // Valid master address
                             rx_buffer_raw[rx_counter] <= uart_rx_byte;
                             rx_checksum <= rx_checksum + uart_rx_byte; // Add to checksum
                             rx_counter <= rx_counter + 1;
@@ -619,7 +707,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     RX_READ_DATA: begin
                         rx_buffer_raw[rx_counter] <= uart_rx_byte;
                         
-                        if (rx_counter < (8'd2 + rx_length)) begin
+                        if (rx_counter < (JVS_OVERHEAD + rx_length)) begin
                             // Still reading data bytes
                             rx_checksum <= rx_checksum + uart_rx_byte;
                             rx_counter <= rx_counter + 1;
@@ -627,8 +715,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             // Last byte (checksum) received
                             if (rx_checksum == uart_rx_byte) begin
                                 rx_state <= RX_UNESCAPE;          // Checksum valid, start unescaping
-                                unescape_read_idx <= 8'd0;        // Start reading from beginning
-                                unescape_write_idx <= 8'd0;       // Start writing from beginning
+                                copy_read_idx <= 8'd0;            // Start reading from beginning
+                                copy_write_idx <= 8'd0;           // Start writing from beginning
                                 rx_counter <= 0;
                             end else begin
                                 rx_state <= RX_IDLE;              // Checksum invalid, discard frame
@@ -645,42 +733,65 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             // RX_UNESCAPE - Copy from raw buffer to final buffer, processing escape sequences
             //-------------------------------------------------------------
             if (rx_state == RX_UNESCAPE) begin
-                if (unescape_read_idx <= (8'd2 + rx_length)) begin // Process header + data + checksum
-                    if (unescape_read_idx < JVS_DATA_START) begin
+                if (copy_read_idx <= (JVS_OVERHEAD + rx_length)) begin // Process header + data + checksum
+                    if (copy_read_idx < JVS_DATA_START) begin
                         // Copy header bytes as-is (sync, addr, length)
-                        rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
-                        unescape_read_idx <= unescape_read_idx + 1;
-                        unescape_write_idx <= unescape_write_idx + 1;
-                    end else if (unescape_read_idx < (8'd2 + rx_length)) begin // In data section
+                        rx_buffer[copy_write_idx] <= rx_buffer_raw[copy_read_idx];
+                        copy_read_idx <= copy_read_idx + 1;
+                        copy_write_idx <= copy_write_idx + 1;
+                    end else if (copy_read_idx < (JVS_OVERHEAD + rx_length)) begin // In data section
                         // Check for escape sequences in data section
-                        if (rx_buffer_raw[unescape_read_idx] == JVS_ESCAPE_BYTE && 
-                            unescape_read_idx + 1 <= (8'd2 + rx_length) &&
-                            (rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_E0 || 
-                             rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_D0)) begin
+                        if (rx_buffer_raw[copy_read_idx] == JVS_ESCAPE_BYTE && 
+                            copy_read_idx + 1 <= (JVS_OVERHEAD + rx_length) &&
+                            (rx_buffer_raw[copy_read_idx + 1] == JVS_ESCAPED_E0 || 
+                             rx_buffer_raw[copy_read_idx + 1] == JVS_ESCAPED_D0)) begin
                             // Process escape sequence
-                            if (rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_E0) begin
-                                rx_buffer[unescape_write_idx] <= JVS_SYNC_BYTE; // D0 DF -> E0
+                            if (rx_buffer_raw[copy_read_idx + 1] == JVS_ESCAPED_E0) begin
+                                rx_buffer[copy_write_idx] <= JVS_SYNC_BYTE; // D0 DF -> E0
                             end else begin
-                                rx_buffer[unescape_write_idx] <= JVS_ESCAPE_BYTE; // D0 CF -> D0
+                                rx_buffer[copy_write_idx] <= JVS_ESCAPE_BYTE; // D0 CF -> D0
                             end
-                            unescape_read_idx <= unescape_read_idx + 2; // Skip both escape bytes
-                            unescape_write_idx <= unescape_write_idx + 1;
+                            copy_read_idx <= copy_read_idx + 2; // Skip both escape bytes
+                            copy_write_idx <= copy_write_idx + 1;
                             // Update length in final buffer (remove 1 byte)
                             rx_buffer[JVS_LENGTH_POS] <= rx_buffer[JVS_LENGTH_POS] - 1;
                         end else begin
                             // Normal byte, copy as-is
-                            rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
-                            unescape_read_idx <= unescape_read_idx + 1;
-                            unescape_write_idx <= unescape_write_idx + 1;
+                            rx_buffer[copy_write_idx] <= rx_buffer_raw[copy_read_idx];
+                            copy_read_idx <= copy_read_idx + 1;
+                            copy_write_idx <= copy_write_idx + 1;
                         end
                     end else begin
                         // Copy checksum
-                        rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
-                        unescape_read_idx <= unescape_read_idx + 1;
-                        unescape_write_idx <= unescape_write_idx + 1;
+                        rx_buffer[copy_write_idx] <= rx_buffer_raw[copy_read_idx];
+                        copy_read_idx <= copy_read_idx + 1;
+                        copy_write_idx <= copy_write_idx + 1;
                     end
                 end else begin
                     // Finished unescaping, move to process
+                    rx_state <= RX_PROCESS;
+                end
+            end
+
+            //-------------------------------------------------------------
+            // RX_COPY_NAME - Copy node name from READ ID response
+            //-------------------------------------------------------------
+            if (rx_state == RX_COPY_NAME) begin
+                if (copy_read_idx < (JVS_OVERHEAD + rx_buffer[JVS_LENGTH_POS]) && copy_write_idx < NODE_NAME_SIZE - 1) begin
+                    // Check for null terminator
+                    if (rx_buffer[copy_read_idx] == 8'h00) begin
+                        // Found null terminator, finish copying
+                        node_name[current_device_addr - 1][copy_write_idx] <= 8'h00;
+                        rx_state <= RX_PROCESS; // Move to process state
+                    end else begin
+                        // Copy character and advance indices
+                        node_name[current_device_addr - 1][copy_write_idx] <= rx_buffer[copy_read_idx];
+                        copy_read_idx <= copy_read_idx + 1;
+                        copy_write_idx <= copy_write_idx + 1;
+                    end
+                end else begin
+                    // Reached end of buffer or max name size, null terminate and finish
+                    node_name[current_device_addr - 1][copy_write_idx] <= 8'h00;
                     rx_state <= RX_PROCESS;
                 end
             end
@@ -691,12 +802,72 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             if (rx_state == RX_PROCESS) begin
                 rx_frame_complete <= 1'b1;                    // Signal frame ready to main state machine
                 
-                // Process input data if this is a READ_INPUTS response
-                if (last_tx_state == STATE_SEND_INPUTS) begin
-                    // Validate response format: E0 00 XX 01 (sync, master addr, length, normal status)
-                    if (rx_buffer[1] == 8'h00 && rx_buffer[3] == STATUS_NORMAL) begin
-                        // Ensure minimum frame size for button data
-                        if (rx_buffer[JVS_LENGTH_POS] >= 8) begin
+                // Process responses based on the last command sent
+                case (last_tx_state)
+                    STATE_SEND_READID: begin
+                        // Process READID response: E0 00 XX 01 01 [ASCII_NAME] 00 checksum
+                        // Example: "namco ltd.;NAJV2;Ver1.00;JPN,Multipurpose."
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL && rx_buffer[JVS_LENGTH_POS] >= 4) begin
+                            // Trigger name copying for current node (current_device_addr - 1 as array index)
+                            if (current_device_addr > 0 && current_device_addr <= MAX_JVS_NODES) begin
+                                // Setup name copying: rx_buffer format [E0][00][LEN][01][01][name...][00][checksum]
+                                copy_read_idx <= JVS_DATA_START + 2;    // Start after status and report bytes
+                                copy_write_idx <= 8'd0;                 // Start writing at beginning of name array
+                                rx_frame_complete <= 1'b0;              // Clear frame complete flag
+                                rx_state <= RX_COPY_NAME;               // Switch to name copying state
+                            end
+                        end
+                    end
+                    
+                    STATE_SEND_CMDREV: begin
+                        // Process CMDREV response: E0 00 XX 01 YY (where YY is revision in BCD)
+                        // Current expected revision is 1.3, so YY should be 0x13
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL && rx_buffer[JVS_LENGTH_POS] >= 3) begin
+                            // Store command revision for current node (current_device_addr - 1 as array index)
+                            if (current_device_addr > 0 && current_device_addr <= MAX_JVS_NODES) begin
+                                node_cmd_ver[current_device_addr - 1] <= rx_buffer[JVS_DATA_START + 1]; // rx_buffer[4] contains revision
+                            end
+                        end
+                    end
+                    
+                    STATE_SEND_JVSREV: begin
+                        // Process JVSREV response: E0 00 XX 01 YY (where YY is JVS revision in BCD)  
+                        // Current expected revision is 3.0, so YY should be 0x30
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL && rx_buffer[JVS_LENGTH_POS] >= 3) begin
+                            // Store JVS revision for current node (current_device_addr - 1 as array index)
+                            if (current_device_addr > 0 && current_device_addr <= MAX_JVS_NODES) begin
+                                node_jvs_ver[current_device_addr - 1] <= rx_buffer[JVS_DATA_START + 1]; // rx_buffer[4] contains revision
+                            end
+                        end
+                    end
+                    
+                    STATE_SEND_COMMVER: begin
+                        // Process COMMVER response: E0 00 XX 01 YY (where YY is comm version in BCD)
+                        // Current expected version is 1.0, so YY should be 0x10  
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL && rx_buffer[JVS_LENGTH_POS] >= 3) begin
+                            // Store communication version for current node (current_device_addr - 1 as array index)
+                            if (current_device_addr > 0 && current_device_addr <= MAX_JVS_NODES) begin
+                                node_com_ver[current_device_addr - 1] <= rx_buffer[JVS_DATA_START + 1]; // rx_buffer[4] contains version
+                            end
+                        end
+                    end
+                    
+                    STATE_SEND_FEATCHK: begin
+                        // Process FEATCHK response: E0 00 XX 01 [function_data...] 00
+                        // Contains 4-byte function descriptors followed by 00 terminator
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL && rx_buffer[JVS_LENGTH_POS] >= 4) begin
+                            // Parse feature data (optional - could extract supported functions)
+                            // Format: [func_code][param1][param2][param3] repeating, then 00
+                            // For now we just acknowledge receipt
+                        end
+                    end
+                    
+                    STATE_SEND_INPUTS: begin
+                        // Process input data response
+                        // Validate response format: E0 00 XX 01 (sync, master addr, length, normal status)
+                        if (rx_buffer[JVS_ADDR_POS] == JVS_HOST_ADDR && rx_buffer[JVS_DATA_START] == STATUS_NORMAL) begin
+                            // Ensure minimum frame size for button data
+                            if (rx_buffer[JVS_LENGTH_POS] >= 8) begin
                             
                             //=================================================
                             // PLAYER 1 BUTTON MAPPING
@@ -802,7 +973,13 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             end
                         end
                     end
-                end
+                    end
+                    
+                    default: begin
+                        // For other commands (SETADDR, READID, etc.), just acknowledge receipt
+                        // No special processing needed
+                    end
+                endcase
                 
                 // Frame processing complete, return to idle state for next frame
                 rx_counter <= 8'h00;

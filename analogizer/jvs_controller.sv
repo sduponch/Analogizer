@@ -124,6 +124,10 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam JVS_DATA_START = 8'd3;        // Start position of data bytes
     localparam JVS_OVERHEAD = 8'd2;          // Overhead for length calculation
 
+    // Buffer size configuration for resource optimization
+    localparam RX_BUFFER_SIZE = 128;         // Size of RX buffers (I/O Identify max 106 bytes)
+    localparam TX_BUFFER_SIZE = 24;          // Size of TX buffer (max frame ~21 bytes)
+
     //=========================================================================
     // STATE MACHINE DEFINITIONS
     //=========================================================================
@@ -155,9 +159,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     localparam RX_READ_ADDR = 3'h1;           // Reading address byte
     localparam RX_READ_SIZE = 3'h2;           // Reading length byte
     localparam RX_READ_DATA = 3'h3;           // Reading data bytes and checksum
-    localparam RX_UNESCAPE = 3'h4;            // After a JVS frame is fully received we process escaping
-    localparam RX_SHIFT = 3'h5;               // On escaping process it shift the buffer 1 byte to the left
-    localparam RX_PROCESS = 3'h6;             // Processing complete and unescaped frame
+    localparam RX_UNESCAPE = 3'h4;            // Copy from raw buffer to final buffer, processing escapes
+    localparam RX_PROCESS = 3'h5;             // Processing complete and unescaped frame
 
     //=========================================================================
     // STATE VARIABLES AND CONTROL REGISTERS
@@ -168,20 +171,21 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
     reg [2:0] rx_state;          // Receive frame processing state
     
     // Transmission buffer and control
-    reg [7:0] tx_buffer [0:31];  // Buffer for outgoing JVS frames (max 32 bytes)
+    reg [7:0] tx_buffer [0:TX_BUFFER_SIZE-1];  // Buffer for outgoing JVS frames
     reg [7:0] tx_length;         // Total length of current transmission
     reg [7:0] tx_counter;        // Current byte position in transmission
     reg [7:0] tx_checksum;       // Running checksum calculation
     reg rs485_tx_request;        // Signal to start RS485 transmission
     
     // Reception buffer and control
-    reg [7:0] rx_buffer [0:255]; // Buffer for incoming JVS frames (max 256 bytes)
+    reg [7:0] rx_buffer_raw [0:RX_BUFFER_SIZE-1]; // Buffer for raw incoming JVS frames with escape sequences
+    reg [7:0] rx_buffer [0:RX_BUFFER_SIZE-1]; // Buffer for unescaped JVS frames (final processed data)
     reg [7:0] rx_length;         // Length of current incoming frame
     reg [7:0] rx_counter;        // Current byte position in reception
     reg [7:0] rx_checksum;       // Running checksum verification
     // Escape sequence decoding variables
-    reg [7:0] unescape_idx;      // Index for unescaping
-    reg [7:0] shift_idx;         // Index for shifting bytes left after escape found
+    reg [7:0] unescape_read_idx;  // Read index in raw buffer
+    reg [7:0] unescape_write_idx; // Write index in final buffer
 
     // Timing and protocol control
     reg [31:0] delay_counter;    // Multi-purpose delay counter
@@ -572,7 +576,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                         if (uart_rx_byte == JVS_SYNC_BYTE) begin  // E0 detected
                             rx_counter <= 8'h01;                  // Next byte position
                             rx_checksum <= 8'h00;                 // Reset checksum
-                            rx_buffer[0] <= uart_rx_byte;         // Store sync byte
+                            rx_buffer_raw[0] <= uart_rx_byte;         // Store sync byte
                             rx_frame_complete <= 1'b0;
                             rx_state <= RX_READ_ADDR;
                         end else begin
@@ -585,7 +589,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     //-----------------------------------------------------
                     RX_READ_ADDR: begin
                         if (uart_rx_byte == 8'h00) begin          // Valid master address
-                            rx_buffer[rx_counter] <= uart_rx_byte;
+                            rx_buffer_raw[rx_counter] <= uart_rx_byte;
                             rx_checksum <= rx_checksum + uart_rx_byte; // Add to checksum
                             rx_counter <= rx_counter + 1;
                             rx_state <= RX_READ_SIZE;
@@ -599,7 +603,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // RX_READ_SIZE - Read frame length byte
                     //-----------------------------------------------------
                     RX_READ_SIZE: begin
-                        rx_buffer[rx_counter] <= uart_rx_byte;
+                        rx_buffer_raw[rx_counter] <= uart_rx_byte;
                         rx_checksum <= rx_checksum + uart_rx_byte;
                         rx_length <= uart_rx_byte;                // Store frame length
                         rx_counter <= rx_counter + 1;
@@ -610,7 +614,7 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                     // RX_READ_DATA - Read data bytes and validate checksum
                     //-----------------------------------------------------
                     RX_READ_DATA: begin
-                        rx_buffer[rx_counter] <= uart_rx_byte;
+                        rx_buffer_raw[rx_counter] <= uart_rx_byte;
                         
                         if (rx_counter < (8'd2 + rx_length)) begin
                             // Still reading data bytes
@@ -620,7 +624,8 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
                             // Last byte (checksum) received
                             if (rx_checksum == uart_rx_byte) begin
                                 rx_state <= RX_UNESCAPE;          // Checksum valid, start unescaping
-                                unescape_idx <= 8'd0;             // Reset to 0, will add 3 in RX_UNESCAPE
+                                unescape_read_idx <= 8'd0;        // Start reading from beginning
+                                unescape_write_idx <= 8'd0;       // Start writing from beginning
                                 rx_counter <= 0;
                             end else begin
                                 rx_state <= RX_IDLE;              // Checksum invalid, discard frame
@@ -634,51 +639,46 @@ module jvs_controller #(parameter MASTER_CLK_FREQ = 50_000_000)
             end
             
             //-------------------------------------------------------------
-            // RX_UNESCAPE - Iterate buffer and look after escape sequence then replace the byte and shift buffer from 1 byte in RX_SHIFT
+            // RX_UNESCAPE - Copy from raw buffer to final buffer, processing escape sequences
             //-------------------------------------------------------------
             if (rx_state == RX_UNESCAPE) begin
-                if (unescape_idx + JVS_DATA_START < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS] - 1)) begin // Add data offset, use original length, -1 for checksum
-                    if (rx_buffer[unescape_idx + JVS_DATA_START] == JVS_ESCAPE_BYTE && 
-                        unescape_idx + JVS_DATA_START + 1 < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS] - 1)) begin
-                        // Escape sequence detected
-                        if (rx_buffer[unescape_idx + JVS_DATA_START + 1] == JVS_ESCAPED_E0) begin
-                            // D0 DF -> E0: Replace first byte, start shifting
-                            rx_buffer[unescape_idx + JVS_DATA_START] <= JVS_SYNC_BYTE;
-                            shift_idx <= unescape_idx + JVS_DATA_START + 1; // Start shifting from next position
-                            rx_state <= RX_SHIFT; // Go to shift state
-                        end else if (rx_buffer[unescape_idx + JVS_DATA_START + 1] == JVS_ESCAPED_D0) begin
-                            // D0 CF -> D0: Replace first byte, start shifting
-                            rx_buffer[unescape_idx + JVS_DATA_START] <= JVS_ESCAPE_BYTE;
-                            shift_idx <= unescape_idx + JVS_DATA_START + 1; // Start shifting from next position
-                            rx_state <= RX_SHIFT; // Go to shift state
+                if (unescape_read_idx <= (8'd2 + rx_length)) begin // Process header + data + checksum
+                    if (unescape_read_idx < JVS_DATA_START) begin
+                        // Copy header bytes as-is (sync, addr, length)
+                        rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
+                        unescape_read_idx <= unescape_read_idx + 1;
+                        unescape_write_idx <= unescape_write_idx + 1;
+                    end else if (unescape_read_idx < (8'd2 + rx_length)) begin // In data section
+                        // Check for escape sequences in data section
+                        if (rx_buffer_raw[unescape_read_idx] == JVS_ESCAPE_BYTE && 
+                            unescape_read_idx + 1 <= (8'd2 + rx_length) &&
+                            (rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_E0 || 
+                             rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_D0)) begin
+                            // Process escape sequence
+                            if (rx_buffer_raw[unescape_read_idx + 1] == JVS_ESCAPED_E0) begin
+                                rx_buffer[unescape_write_idx] <= JVS_SYNC_BYTE; // D0 DF -> E0
+                            end else begin
+                                rx_buffer[unescape_write_idx] <= JVS_ESCAPE_BYTE; // D0 CF -> D0
+                            end
+                            unescape_read_idx <= unescape_read_idx + 2; // Skip both escape bytes
+                            unescape_write_idx <= unescape_write_idx + 1;
+                            // Update length in final buffer (remove 1 byte)
+                            rx_buffer[JVS_LENGTH_POS] <= rx_buffer[JVS_LENGTH_POS] - 1;
                         end else begin
-                            // Not a valid escape sequence, move to next byte
-                            unescape_idx <= unescape_idx + 1;
+                            // Normal byte, copy as-is
+                            rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
+                            unescape_read_idx <= unescape_read_idx + 1;
+                            unescape_write_idx <= unescape_write_idx + 1;
                         end
                     end else begin
-                        // Normal byte, move to next position
-                        unescape_idx <= unescape_idx + 1;
+                        // Copy checksum
+                        rx_buffer[unescape_write_idx] <= rx_buffer_raw[unescape_read_idx];
+                        unescape_read_idx <= unescape_read_idx + 1;
+                        unescape_write_idx <= unescape_write_idx + 1;
                     end
                 end else begin
-                    // Finished processing, reset index and move to RX_PROCESS
-                    unescape_idx <= 8'h00;
+                    // Finished unescaping, move to process
                     rx_state <= RX_PROCESS;
-                end
-            end
-
-            //-------------------------------------------------------------
-            // RX_SHIFT - Shift bytes left after escape sequence removal and update buffer length byte
-            //-------------------------------------------------------------
-            if (rx_state == RX_SHIFT) begin
-                if (shift_idx < (JVS_DATA_START + rx_buffer[JVS_LENGTH_POS])) begin // Use current length
-                    // Shift current byte one position left
-                    rx_buffer[shift_idx] <= rx_buffer[shift_idx + 1];
-                    shift_idx <= shift_idx + 1;
-                end else begin
-                    // Finished shifting, now decrement length since we removed one byte
-                    rx_buffer[JVS_LENGTH_POS] <= rx_buffer[JVS_LENGTH_POS] - 1;
-                    // Continue unescaping from same position (don't increment unescape_idx)
-                    rx_state <= RX_UNESCAPE;
                 end
             end
 
